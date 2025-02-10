@@ -1,0 +1,15 @@
+[Unit]
+Description=Hash Load Balancer Service
+After=network.target
+
+[Service]
+Environment="PYTHONUNBUFFERED=1"
+Environment="MORPH_API_KEY=morph_fdBw4OOQ9NwU6REhYRtmnv"
+ExecStart=/usr/bin/python3 -u /root/load_balancer.py
+WorkingDirectory=/root
+StandardOutput=journal
+StandardError=journal
+Restart=always
+
+[Install]
+WantedBy=multi-user.target 
