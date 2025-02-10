@@ -101,10 +101,10 @@ def wait_for_worker(worker_url, timeout=40):
     while time.time() - start_time < timeout:
         try:
             response = requests.get(worker_url, timeout=4)
-            print(response)
             if response.status_code == 200:
                 print(f"Worker {worker_url} is ready!")
                 return True
+            print(response)
         except requests.exceptions.RequestException:
             print(f"Worker {worker_url} is not ready yet, retrying...")
             time.sleep(3)
