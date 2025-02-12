@@ -7,7 +7,8 @@ User=root
 WorkingDirectory=/root
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/root
-ExecStart=/root/venv/bin/uvicorn load_balancer:app --host 0.0.0.0 --port 8000 --log-level debug
+Environment=MORPH_API_KEY=morph_fdBw4OOQ9NwU6REhYRtmnv
+ExecStart=/venv/bin/uvicorn load_balancer:app --host 0.0.0.0 --port 8000 --log-level debug
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

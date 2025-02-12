@@ -43,48 +43,29 @@ log "Started instance: $INSTANCE_ID"
 log "Waiting for instance to be ready..."
 sleep 5
 
+# Initial system setup
+log "Setting up system dependencies..."
+morphcloud instance exec "$INSTANCE_ID" "sudo apt-get update && sudo apt-get install -y apt-utils"
+morphcloud instance exec "$INSTANCE_ID" "sudo apt-get install -y python3-full python3-venv"
+
 # Copy files to instance
 log "Copying files..."
-morphcloud instance copy load_balancer.py "$INSTANCE_ID:~/load_balancer.py"
+morphcloud instance copy load_balancer.py "$INSTANCE_ID:"
 log "Copied load_balancer.py"
-morphcloud instance copy worker.py "$INSTANCE_ID:~/worker.py"
+morphcloud instance copy worker.py "$INSTANCE_ID:"
 log "Copied worker.py"
 
-# Create service file with correct uvicorn command
-log "Creating service file..."
-cat > hash-balancer.service << EOF
-[Unit]
-Description=Hash Load Balancer Service
-After=network.target
-
-[Service]
-User=root
-WorkingDirectory=/root
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/root
-ExecStart=/root/venv/bin/uvicorn load_balancer:app --host 0.0.0.0 --port 8000 --log-level debug
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Copy the newly created service file
+# Copy service files
+log "Copying service files..."
 morphcloud instance copy hash-balancer.service "$INSTANCE_ID:/etc/systemd/system/hash-balancer.service"
 log "Copied hash-balancer.service"
-
-# Install dependencies and setup services
-log "Installing dependencies..."
-morphcloud instance exec "$INSTANCE_ID" "sudo apt-get update"
-morphcloud instance exec "$INSTANCE_ID" "sudo apt-get install -y python3-full python3-venv"
+morphcloud instance copy worker.service "$INSTANCE_ID:/etc/systemd/system/worker.service"
+log "Copied worker.service"
 
 # Create and setup virtual environment
 log "Setting up Python virtual environment..."
-morphcloud instance exec "$INSTANCE_ID" "python3 -m venv ~/venv"
-morphcloud instance exec "$INSTANCE_ID" "~/venv/bin/pip install fastapi uvicorn[standard] aiohttp pydantic morphcloud"
+morphcloud instance exec "$INSTANCE_ID" "python3 -m venv /venv"
+morphcloud instance exec "$INSTANCE_ID" "/venv/bin/pip install --no-cache-dir fastapi uvicorn[standard] aiohttp pydantic morphcloud"
 
 # Start the service
 log "Setting up services..."
@@ -100,10 +81,10 @@ log "Checking detailed service logs..."
 morphcloud instance exec "$INSTANCE_ID" "sudo journalctl -u hash-balancer.service -n 50 --no-pager"
 
 log "Checking if files exist and have correct permissions..."
-morphcloud instance exec "$INSTANCE_ID" "ls -la /root/load_balancer.py /root/venv/bin/uvicorn"
+morphcloud instance exec "$INSTANCE_ID" "ls -la /root/load_balancer.py /venv/bin/uvicorn"
 
 log "Checking Python environment..."
-morphcloud instance exec "$INSTANCE_ID" "/root/venv/bin/python3 -c 'import fastapi, uvicorn; print(\"Imports OK\")'"
+morphcloud instance exec "$INSTANCE_ID" "/venv/bin/python3 -c 'import fastapi, uvicorn; print(\"Imports OK\")'"
 
 # Expose HTTP service
 log "Exposing HTTP service..."

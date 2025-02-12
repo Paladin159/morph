@@ -17,7 +17,7 @@ app = FastAPI()
 MAX_WORKERS = 12
 REQUESTS_PER_WORKER = 16
 DEFAULT_TIMEOUT = 30
-WORKER_PORT = 8000
+WORKER_PORT = 5000
 
 class HashRequest(BaseModel):
     input_string: str
@@ -54,13 +54,14 @@ class WorkerManager:
             # Copy files using SSH
             with instance.ssh() as ssh:
                 logger.info("Copying worker files...")
-                ssh.put("worker.py", "~/worker.py")
-                ssh.put("worker.service", "/etc/servicemd/worker.service")
+                ssh.put("worker.py", "/root/worker.py")
+                ssh.put("worker.service", "/etc/systemd/system/worker.service")
                 
                 logger.info("Installing dependencies...")
                 ssh.run("sudo apt-get update")
-                ssh.run("sudo apt-get install -y python3 python3-pip")
-                ssh.run("sudo pip3 install fastapi uvicorn aiohttp pydantic")
+                ssh.run("sudo apt-get install -y python3-full python3-venv")
+                ssh.run("python3 -m venv /venv")
+                ssh.run("/venv/bin/pip install fastapi uvicorn[standard] aiohttp pydantic")
                 
                 logger.info("Starting worker service...")
                 ssh.run("sudo systemctl daemon-reload")
