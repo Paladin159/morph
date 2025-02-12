@@ -708,6 +708,7 @@ class Instance(BaseModel):
 
     def ssh(self):
         from morphcloud._ssh import SSHClient  # as in your snippet
+
         return SSHClient(self.ssh_connect())
 
     def __enter__(self):
@@ -788,7 +789,9 @@ class Instance(BaseModel):
             except FileNotFoundError:
                 return None
 
-        def should_ignore(path: str, base_dir: str, ignore_spec: Optional[pathspec.PathSpec]) -> bool:
+        def should_ignore(
+            path: str, base_dir: str, ignore_spec: Optional[pathspec.PathSpec]
+        ) -> bool:
             if not ignore_spec:
                 return False
             rel_path = os.path.relpath(path, base_dir)
@@ -843,7 +846,7 @@ class Instance(BaseModel):
                 if stderr.strip():
                     logger.debug(f"[ls -lR stderr] {stderr.strip()}")
 
-                lines = stdout.split('\n')
+                lines = stdout.split("\n")
                 current_dir = None
 
                 for line in lines:
@@ -874,17 +877,24 @@ class Instance(BaseModel):
                             if os.path.isfile(full_path):
                                 # respect .gitignore if needed
                                 logger.debug("triggering?")
-                                if ignore_spec and should_ignore(full_path, local_path, ignore_spec):
+                                if ignore_spec and should_ignore(
+                                    full_path, local_path, ignore_spec
+                                ):
                                     logger.debug(f"Ignoring (gitignore) {full_path}")
                                     continue
                                 try:
                                     st = os.stat(full_path)
                                     info[full_path] = (st.st_size, st.st_mtime)
                                 except FileNotFoundError:
-                                    logger.debug(f"File not found while stat()'ing: {full_path}")
+                                    logger.debug(
+                                        f"File not found while stat()'ing: {full_path}"
+                                    )
 
             except Exception as e:
-                logger.warning(f"Failed to retrieve local file info via `ls -lR`. {e}", exc_info=True)
+                logger.warning(
+                    f"Failed to retrieve local file info via `ls -lR`. {e}",
+                    exc_info=True,
+                )
                 # fallback
                 return get_local_info_fallback(local_path)
 
@@ -896,13 +906,17 @@ class Instance(BaseModel):
             if os.name == "posix":
                 return get_local_info_via_ls(local_path)
             else:
-                logger.info("Non-POSIX OS detected; falling back to Python's rglob for local scanning.")
+                logger.info(
+                    "Non-POSIX OS detected; falling back to Python's rglob for local scanning."
+                )
                 return get_local_info_fallback(local_path)
 
         # ---------------------------------------------------------------------
         # 3) REMOTE SCANNING VIA "ls -lR" (fast)
         # ---------------------------------------------------------------------
-        def get_file_info_via_ssh(ssh_client, remote_path: str) -> Dict[str, Tuple[int, float]]:
+        def get_file_info_via_ssh(
+            ssh_client, remote_path: str
+        ) -> Dict[str, Tuple[int, float]]:
             """
             Retrieve remote file info using 'ls -lR' (fast single-pass).
             Return {full_remote_path: (size, 0.0 or mtime)}. We'll store 0.0 as placeholder for mtime,
@@ -934,16 +948,22 @@ class Instance(BaseModel):
                         try:
                             size = int(size_str)
                         except ValueError:
-                            logger.warning(f"Could not parse size '{size_str}' from line: {line}")
+                            logger.warning(
+                                f"Could not parse size '{size_str}' from line: {line}"
+                            )
                             continue
                         if current_dir:
-                            full_path = os.path.join(current_dir, name).replace("\\", "/")
+                            full_path = os.path.join(current_dir, name).replace(
+                                "\\", "/"
+                            )
                             file_info[full_path] = (size, 0.0)  # ignoring actual mtime
                 if stderr.strip():
                     logger.debug(f"Error from ls -lR: {stderr.strip()}")
 
             except Exception as e:
-                logger.error(f"Failed to retrieve remote file info via SSH: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to retrieve remote file info via SSH: {e}", exc_info=True
+                )
                 raise
             logger.info(f"Found {len(file_info)} remote files via ls -lR.")
             return file_info
@@ -998,7 +1018,9 @@ class Instance(BaseModel):
             # We first spawn tasks that call self.ssh() in parallel
             with ThreadPoolExecutor(max_concurrent_creates) as pool:
                 # pool.map(...) returns an iterator of results in the same order
-                ssh_clients = list(pool.map(lambda _: self.ssh(), range(num_connections)))
+                ssh_clients = list(
+                    pool.map(lambda _: self.ssh(), range(num_connections))
+                )
 
             # Now we’ve created all the SSH connections, place them into the queue
             for i, cli in enumerate(ssh_clients, start=1):
@@ -1006,7 +1028,6 @@ class Instance(BaseModel):
                 conn_queue.put(cli)
 
             return conn_queue
-
 
         def close_ssh_pool(conn_queue: queue.Queue):
             """
@@ -1053,7 +1074,7 @@ class Instance(BaseModel):
         def parallel_remote_downloads(
             actions: List[Tuple[str, str, str, int, float]],
             total_size: int,
-            ssh_queue: queue.Queue
+            ssh_queue: queue.Queue,
         ):
             """
             Each thread: retrieve an SSH client from the pool, open SFTP, perform
@@ -1061,13 +1082,16 @@ class Instance(BaseModel):
             parameter, so no changes are needed there to avoid small-file hangs.
             """
             from tqdm import tqdm
+
             pbar_lock = threading.Lock()
 
             if not actions:
                 logger.info("No remote->local actions to process.")
                 return
 
-            logger.info(f"Processing {len(actions)} remote->local actions with {max_workers} parallel workers.")
+            logger.info(
+                f"Processing {len(actions)} remote->local actions with {max_workers} parallel workers."
+            )
             with tqdm(total=total_size, unit="B", unit_scale=True) as pbar:
 
                 def worker(action):
@@ -1075,13 +1099,17 @@ class Instance(BaseModel):
                     try:
                         atype, src, dst, size, mtime = action
                         thread_id = threading.get_ident()
-                        logger.info(f"[Thread {thread_id}] remote->local {atype} src={src}, dst={dst}")
+                        logger.info(
+                            f"[Thread {thread_id}] remote->local {atype} src={src}, dst={dst}"
+                        )
 
                         sftp = ssh_client._client.open_sftp()
                         try:
                             if atype == "copy":
                                 with pbar_lock:
-                                    pbar.set_description(f"Downloading {os.path.basename(dst)}")
+                                    pbar.set_description(
+                                        f"Downloading {os.path.basename(dst)}"
+                                    )
                                 os.makedirs(os.path.dirname(dst), exist_ok=True)
 
                                 # sftp.get does not provide a 'confirm' param, so we rely on normal completion
@@ -1095,11 +1123,15 @@ class Instance(BaseModel):
 
                             elif atype == "delete":
                                 with pbar_lock:
-                                    pbar.set_description(f"Deleting (local) {os.path.basename(dst)}")
+                                    pbar.set_description(
+                                        f"Deleting (local) {os.path.basename(dst)}"
+                                    )
                                 try:
                                     os.remove(dst)
                                 except FileNotFoundError:
-                                    logger.warning(f"Local file not found for delete: {dst}")
+                                    logger.warning(
+                                        f"Local file not found for delete: {dst}"
+                                    )
                         finally:
                             sftp.close()
                     finally:
@@ -1114,7 +1146,9 @@ class Instance(BaseModel):
                     for fut in as_completed(futures):
                         exc = fut.exception()
                         if exc:
-                            logger.error("Download worker encountered an error:", exc_info=True)
+                            logger.error(
+                                "Download worker encountered an error:", exc_info=True
+                            )
                             raise exc
 
             logger.info("All remote->local actions completed successfully.")
@@ -1126,7 +1160,7 @@ class Instance(BaseModel):
         def parallel_remote_uploads(
             actions: List[Tuple[str, str, str, int, float]],
             total_size: int,
-            ssh_queue: queue.Queue
+            ssh_queue: queue.Queue,
         ):
             """
             Parallel local->remote uploads with a 30-second per-file timeout.
@@ -1165,7 +1199,11 @@ class Instance(BaseModel):
             # HELPER: SFTP put with a 30-second timeout in a separate thread
             # ----------------------------------------------------------------------
             def sftp_put_with_timeout(
-                sftp: "paramiko.SFTPClient", src: str, dst: str, confirm: bool, timeout: float
+                sftp: "paramiko.SFTPClient",
+                src: str,
+                dst: str,
+                confirm: bool,
+                timeout: float,
             ):
                 """
                 Calls sftp.put(src, dst, confirm=confirm) in a separate thread and waits
@@ -1180,7 +1218,9 @@ class Instance(BaseModel):
                 upload_thread.join(timeout)
                 if upload_thread.is_alive():
                     # Timed out
-                    raise TimeoutError(f"SFTP put timed out after {timeout} seconds: {src} -> {dst}")
+                    raise TimeoutError(
+                        f"SFTP put timed out after {timeout} seconds: {src} -> {dst}"
+                    )
 
             # ----------------------------------------------------------------------
             # WORKER FUNCTION
@@ -1229,14 +1269,18 @@ class Instance(BaseModel):
 
                             # Show which file is being processed in tqdm
                             with pbar_lock:
-                                pbar.set_description(f"Uploading {os.path.basename(src)}")
+                                pbar.set_description(
+                                    f"Uploading {os.path.basename(src)}"
+                                )
 
                             # Ensure remote dir
                             remote_dir = os.path.dirname(dst)
                             make_remote_dirs(sftp, remote_dir)
 
                             # (3) Actually do the upload with a 30s timeout
-                            sftp_put_with_timeout(sftp, src, dst, confirm=False, timeout=30.0)
+                            sftp_put_with_timeout(
+                                sftp, src, dst, confirm=False, timeout=30.0
+                            )
 
                             # If you want, you can set remote file times, but be aware some servers hang on setstat:
                             # sftp.utime(dst, (mtime, mtime))
@@ -1280,7 +1324,7 @@ class Instance(BaseModel):
                         error = ex
                         logger.warning(
                             f"[Thread {thread_name}/{thread_id}] Unknown error in attempt {attempt_num}/{attempts}: {ex}",
-                            exc_info=True
+                            exc_info=True,
                         )
                         # Decide if you want to retry or break immediately
                         # For safety, let's break after a non-timeout error
@@ -1338,7 +1382,9 @@ class Instance(BaseModel):
                 try:
                     sftp = ssh_client._client.open_sftp()
                     with pbar_lock:
-                        pbar.set_description(f"Deleting (remote) {os.path.basename(dst)}")
+                        pbar.set_description(
+                            f"Deleting (remote) {os.path.basename(dst)}"
+                        )
                     try:
                         sftp.remove(dst)
                     except IOError:
@@ -1350,9 +1396,7 @@ class Instance(BaseModel):
                         sftp.close()
                     ssh_queue.put(ssh_client)
 
-                logger.info(
-                    f"[Thread {thread_name}/{thread_id}] -> END DELETE: {dst}"
-                )
+                logger.info(f"[Thread {thread_name}/{thread_id}] -> END DELETE: {dst}")
 
             # ----------------------------------------------------------------------
             # MAIN EXECUTION
@@ -1393,7 +1437,6 @@ class Instance(BaseModel):
                 f"Total elapsed: {batch_elapsed:.2f} seconds"
             )
 
-        
         # ---------------------------------------------------------------------
         # 9) SYNC REMOTE->LOCAL
         # ---------------------------------------------------------------------
@@ -1436,7 +1479,8 @@ class Instance(BaseModel):
             if delete:
                 # If something is in local but not in remote_info, we remove it
                 remote_files = set(
-                    os.path.join(local_path, os.path.relpath(k, remote_path)) for k in remote_info.keys()
+                    os.path.join(local_path, os.path.relpath(k, remote_path))
+                    for k in remote_info.keys()
                 )
                 for lfile in local_info:
                     if lfile not in remote_files:
@@ -1447,7 +1491,9 @@ class Instance(BaseModel):
             total_size_to_copy = sum(a[3] for a in actions if a[0] == "copy")
 
             logger.info("REMOTE->LOCAL Changes to be made:")
-            logger.info(f"  Copy:   {total_copies} files ({format_size(total_size_to_copy)})")
+            logger.info(
+                f"  Copy:   {total_copies} files ({format_size(total_size_to_copy)})"
+            )
             if delete:
                 logger.info(f"  Delete: {total_deletes} files")
 
@@ -1459,7 +1505,9 @@ class Instance(BaseModel):
                 logger.info("[DRY RUN] (remote->local) Actions:")
                 for atype, src, dst, size, mtime in actions:
                     if atype == "copy":
-                        logger.info(f"  Would copy: {src} -> {dst} ({format_size(size)})")
+                        logger.info(
+                            f"  Would copy: {src} -> {dst} ({format_size(size)})"
+                        )
                     else:
                         logger.info(f"  Would delete: {dst}")
                 return
@@ -1489,7 +1537,9 @@ class Instance(BaseModel):
                 sftp.close()
 
                 # Gather remote info via 'ls -lR'
-                logger.info(f"Gathering remote file info via ls -lR on '{remote_path}'...")
+                logger.info(
+                    f"Gathering remote file info via ls -lR on '{remote_path}'..."
+                )
                 try:
                     remote_info = get_file_info_via_ssh(ssh_client, remote_path)
                 except Exception as e:
@@ -1518,8 +1568,12 @@ class Instance(BaseModel):
 
             if delete:
                 # Delete files on remote if they don't exist locally
-                local_targets = {os.path.join(remote_path, os.path.relpath(k, local_path)).replace("\\", "/")
-                                 for k in local_info.keys()}
+                local_targets = {
+                    os.path.join(remote_path, os.path.relpath(k, local_path)).replace(
+                        "\\", "/"
+                    )
+                    for k in local_info.keys()
+                }
                 for rfile in remote_info:
                     if rfile not in local_targets:
                         actions.append(("delete", None, rfile, 0, 0))
@@ -1529,7 +1583,9 @@ class Instance(BaseModel):
             total_size_to_copy = sum(a[3] for a in actions if a[0] == "copy")
 
             logger.info("LOCAL->REMOTE Changes to be made:")
-            logger.info(f"  Copy:   {total_copies} files ({format_size(total_size_to_copy)})")
+            logger.info(
+                f"  Copy:   {total_copies} files ({format_size(total_size_to_copy)})"
+            )
             if delete:
                 logger.info(f"  Delete: {total_deletes} files")
 
@@ -1542,7 +1598,9 @@ class Instance(BaseModel):
                 logger.info("[DRY RUN] (local->remote) Actions:")
                 for atype, src, dst, size, _ in actions:
                     if atype == "copy":
-                        logger.info(f"  Would copy: {src} -> {dst} ({format_size(size)})")
+                        logger.info(
+                            f"  Would copy: {src} -> {dst} ({format_size(size)})"
+                        )
                     else:
                         logger.info(f"  Would delete: {dst}")
                 return
@@ -1559,7 +1617,9 @@ class Instance(BaseModel):
 
             # Exactly one must be remote
             if (src_inst and dst_inst) or (not src_inst and not dst_inst):
-                raise ValueError("One (and only one) path must be remote (instance_id:/path)")
+                raise ValueError(
+                    "One (and only one) path must be remote (instance_id:/path)"
+                )
 
             instance_id = src_inst or dst_inst
             if instance_id != self.id:
@@ -1570,11 +1630,15 @@ class Instance(BaseModel):
             try:
                 if src_inst:
                     # remote->local
-                    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Syncing FROM remote -> local, parallel.")
+                    logger.info(
+                        f"{'[DRY RUN] ' if dry_run else ''}Syncing FROM remote -> local, parallel."
+                    )
                     sync_from_remote(ssh_pool, src_path_, dst_path_)
                 else:
                     # local->remote
-                    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Syncing TO remote <- local, parallel.")
+                    logger.info(
+                        f"{'[DRY RUN] ' if dry_run else ''}Syncing TO remote <- local, parallel."
+                    )
                     sync_to_remote(ssh_pool, src_path_, dst_path_)
             finally:
                 close_ssh_pool(ssh_pool)
