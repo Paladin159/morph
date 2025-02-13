@@ -29,74 +29,120 @@ wait_for_service() {
 export MORPH_API_KEY="morph_fdBw4OOQ9NwU6REhYRtmnv"
 log "Set MORPH_API_KEY"
 
-# Create snapshot
-log "Creating snapshot..."
-SNAPSHOT_ID=$(morphcloud snapshot create --memory 512 --disk-size 2056 --image-id morphvm-minimal)
-log "Created snapshot: $SNAPSHOT_ID"
+# Create snapshot for load balancer
+log "Creating load balancer snapshot..."
+LB_SNAPSHOT_ID=$(morphcloud snapshot create --memory 512 --disk-size 2056 --image-id morphvm-minimal)
+log "Created load balancer snapshot: $LB_SNAPSHOT_ID"
 
-# Start instance
-log "Starting instance..."
-INSTANCE_ID=$(morphcloud instance start "$SNAPSHOT_ID")
-log "Started instance: $INSTANCE_ID"
+# Create snapshot for permanent worker
+log "Creating permanent worker snapshot..."
+WORKER_SNAPSHOT_ID=$(morphcloud snapshot create --memory 128 --disk-size 700 --image-id morphvm-minimal)
+log "Created worker snapshot: $WORKER_SNAPSHOT_ID"
 
-# Wait for instance to be ready
-log "Waiting for instance to be ready..."
+# Start load balancer instance
+log "Starting load balancer instance..."
+LB_INSTANCE_ID=$(morphcloud instance start "$LB_SNAPSHOT_ID")
+log "Started load balancer instance: $LB_INSTANCE_ID"
+
+# Start permanent worker instance
+log "Starting permanent worker instance..."
+WORKER_INSTANCE_ID=$(morphcloud instance start "$WORKER_SNAPSHOT_ID")
+log "Started worker instance: $WORKER_INSTANCE_ID"
+
+# Wait for instances to be ready
+log "Waiting for instances to be ready..."
 sleep 5
 
-# Initial system setup
-log "Setting up system dependencies..."
-morphcloud instance exec "$INSTANCE_ID" "sudo apt-get update && sudo apt-get install -y apt-utils"
-morphcloud instance exec "$INSTANCE_ID" "sudo apt-get install -y python3-full python3-venv"
+# Set up load balancer and fix time sync
+log "Setting up load balancer..."
+morphcloud instance exec "$LB_INSTANCE_ID" "sudo apt-get update && sudo apt-get install -y --no-install-recommends ntp && sudo service ntp stop && sudo ntpd -gq && sudo service ntp start"
+morphcloud instance exec "$LB_INSTANCE_ID" "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get update && sudo -E apt-get install -y apt-utils python3-full"
+morphcloud instance exec "$LB_INSTANCE_ID" "sudo mkdir -p /root/hashservice"
 
-# Copy files to instance
-log "Copying files..."
-morphcloud instance copy load_balancer.py "$INSTANCE_ID:"
-log "Copied load_balancer.py"
-morphcloud instance copy worker.py "$INSTANCE_ID:"
-log "Copied worker.py"
+# Copy load balancer files
+log "Copying load balancer files..."
+morphcloud instance copy load_balancer.py "$LB_INSTANCE_ID:/root/hashservice/"
+morphcloud instance copy requirements.txt "$LB_INSTANCE_ID:/root/hashservice/"
+morphcloud instance copy hash-balancer.service "$LB_INSTANCE_ID:/etc/systemd/system/"
 
-# Copy service files
-log "Copying service files..."
-morphcloud instance copy hash-balancer.service "$INSTANCE_ID:/etc/systemd/system/hash-balancer.service"
-log "Copied hash-balancer.service"
-morphcloud instance copy worker.service "$INSTANCE_ID:/etc/systemd/system/worker.service"
-log "Copied worker.service"
+# Set up virtual environment with Python packages
+log "Installing Python packages on load balancer..."
+morphcloud instance exec "$LB_INSTANCE_ID" "cd /root/hashservice && python3 -m venv venv && source venv/bin/activate && pip install --no-cache-dir -r requirements.txt"
 
-# Create and setup virtual environment
-log "Setting up Python virtual environment..."
-morphcloud instance exec "$INSTANCE_ID" "python3 -m venv /venv"
-morphcloud instance exec "$INSTANCE_ID" "/venv/bin/pip install --no-cache-dir fastapi uvicorn[standard] aiohttp pydantic morphcloud"
+# Set up permanent worker
+log "Setting up permanent worker..."
 
-# Start the service
-log "Setting up services..."
-morphcloud instance exec "$INSTANCE_ID" "sudo systemctl daemon-reload"
-morphcloud instance exec "$INSTANCE_ID" "sudo systemctl enable hash-balancer.service"
-morphcloud instance exec "$INSTANCE_ID" "sudo systemctl start hash-balancer.service"
+# Create and enable swap
+log "Setting up swap for worker..."
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo fallocate -l 128M /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
 
-# Service status check
-log "Checking service status..."
-morphcloud instance exec "$INSTANCE_ID" "sudo systemctl status hash-balancer.service"
+# Install minimal packages on worker and fix time sync
+log "Setting up worker environment..."
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo apt-get update && sudo apt-get install -y --no-install-recommends ntp && sudo service ntp stop && sudo ntpd -gq && sudo service ntp start"
+morphcloud instance exec "$WORKER_INSTANCE_ID" "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get update && sudo -E apt-get install -y --no-install-recommends python3-minimal python3-fastapi python3-uvicorn"
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo mkdir -p /root/hashservice"
 
-log "Checking detailed service logs..."
-morphcloud instance exec "$INSTANCE_ID" "sudo journalctl -u hash-balancer.service -n 50 --no-pager"
+# Copy worker files
+log "Copying worker files..."
+morphcloud instance copy worker.py "$WORKER_INSTANCE_ID:/root/hashservice/"
+morphcloud instance copy worker.service "$WORKER_INSTANCE_ID:/etc/systemd/system/"
 
-log "Checking if files exist and have correct permissions..."
-morphcloud instance exec "$INSTANCE_ID" "ls -la /root/load_balancer.py /venv/bin/uvicorn"
+# Start worker service
+log "Starting worker service..."
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo systemctl daemon-reload"
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo systemctl enable worker.service"
+morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo systemctl start worker.service"
 
-log "Checking Python environment..."
-morphcloud instance exec "$INSTANCE_ID" "/venv/bin/python3 -c 'import fastapi, uvicorn; print(\"Imports OK\")'"
+# Expose worker HTTP port
+log "Exposing worker HTTP port..."
+morphcloud instance expose-http "$WORKER_INSTANCE_ID" "worker" 5000
 
-# Expose HTTP service
-log "Exposing HTTP service..."
-morphcloud instance expose-http "$INSTANCE_ID" "web" 8000
+# Get worker URL
+log "Getting worker details..."
+WORKER_INFO=$(morphcloud instance get "$WORKER_INSTANCE_ID")
+WORKER_URL=$(echo "$WORKER_INFO" | python3 -c "
+import sys, json
+info = json.load(sys.stdin)
+services = info['networking']['http_services']
+for service in services:
+    if service['name'] == 'worker':
+        print(service['url'])
+        break
+")
 
-# Get instance details
-log "Getting instance details..."
-INSTANCE_INFO=$(morphcloud instance get "$INSTANCE_ID")
-log "Instance info: $INSTANCE_INFO"
+if [ -z "$WORKER_URL" ]; then
+    log "Failed to get worker URL"
+    exit 1
+fi
 
-# Parse JSON using Python to get the URL
-INSTANCE_URL=$(echo "$INSTANCE_INFO" | python3 -c "
+# Configure load balancer with worker info
+log "Configuring load balancer with worker info..."
+cat > worker_config.json << EOL
+{
+    "template_worker_id": "$WORKER_INSTANCE_ID",
+    "template_worker_url": "$WORKER_URL",
+    "load_balancer_id": "$LB_INSTANCE_ID",
+    "worker_snapshot_id": "$WORKER_SNAPSHOT_ID",
+    "load_balancer_snapshot_id": "$LB_SNAPSHOT_ID"
+}
+EOL
+morphcloud instance copy worker_config.json "$LB_INSTANCE_ID:/root/hashservice/"
+rm worker_config.json
+
+# Start load balancer service
+log "Starting load balancer service..."
+morphcloud instance exec "$LB_INSTANCE_ID" "sudo systemctl daemon-reload"
+morphcloud instance exec "$LB_INSTANCE_ID" "sudo systemctl enable hash-balancer.service"
+morphcloud instance exec "$LB_INSTANCE_ID" "sudo systemctl start hash-balancer.service"
+
+# Expose load balancer HTTP port
+log "Exposing load balancer HTTP port..."
+morphcloud instance expose-http "$LB_INSTANCE_ID" "web" 8000
+
+# Get load balancer URL
+log "Getting load balancer details..."
+LB_INFO=$(morphcloud instance get "$LB_INSTANCE_ID")
+LB_URL=$(echo "$LB_INFO" | python3 -c "
 import sys, json
 info = json.load(sys.stdin)
 services = info['networking']['http_services']
@@ -106,12 +152,11 @@ for service in services:
         break
 ")
 
-if [ -z "$INSTANCE_URL" ]; then
-    log "Failed to get instance URL"
+if [ -z "$LB_URL" ]; then
+    log "Failed to get load balancer URL"
     exit 1
 fi
 
-log "Setup complete! Load balancer is running at $INSTANCE_URL"
-
-log "Checking service status..."
-morphcloud instance exec "$INSTANCE_ID" "sudo systemctl status hash-balancer.service"
+log "Setup complete!"
+log "Load balancer is running at $LB_URL"
+log "Permanent worker is running at $WORKER_URL"
