@@ -37,4 +37,8 @@ wheels/
 
 # Local environment
 .env
-.env.local 
+.env.local
+
+# Project specific
+Basic.py
+setup_worker.sh 
