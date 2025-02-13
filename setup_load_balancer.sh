@@ -25,9 +25,18 @@ wait_for_service() {
     return 1
 }
 
-# Set API key
-export MORPH_API_KEY="morph_fdBw4OOQ9NwU6REhYRtmnv"
-log "Set MORPH_API_KEY"
+# Load environment variables from .env file
+if [ -f .env ]; then
+    export $(cat .env | xargs)
+fi
+
+# Check if API key is set
+if [ -z "$MORPH_API_KEY" ]; then
+    log "Error: MORPH_API_KEY environment variable is not set"
+    exit 1
+fi
+
+log "Using API key from environment"
 
 # Create snapshot for load balancer
 log "Creating load balancer snapshot..."
@@ -64,6 +73,7 @@ log "Copying load balancer files..."
 morphcloud instance copy load_balancer.py "$LB_INSTANCE_ID:/root/hashservice/"
 morphcloud instance copy requirements.txt "$LB_INSTANCE_ID:/root/hashservice/"
 morphcloud instance copy hash-balancer.service "$LB_INSTANCE_ID:/etc/systemd/system/"
+morphcloud instance copy .env "$LB_INSTANCE_ID:/root/hashservice/"
 
 # Set up virtual environment with Python packages
 log "Installing Python packages on load balancer..."
@@ -86,6 +96,7 @@ morphcloud instance exec "$WORKER_INSTANCE_ID" "sudo mkdir -p /root/hashservice"
 log "Copying worker files..."
 morphcloud instance copy worker.py "$WORKER_INSTANCE_ID:/root/hashservice/"
 morphcloud instance copy worker.service "$WORKER_INSTANCE_ID:/etc/systemd/system/"
+morphcloud instance copy .env "$WORKER_INSTANCE_ID:/root/hashservice/"
 
 # Start worker service
 log "Starting worker service..."

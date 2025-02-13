@@ -6,9 +6,18 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# Set API key
-export MORPH_API_KEY="morph_fdBw4OOQ9NwU6REhYRtmnv"
-log "Set MORPH_API_KEY"
+# Load environment variables from .env file
+if [ -f .env ]; then
+    export $(cat .env | xargs)
+fi
+
+# Check if API key is set
+if [ -z "$MORPH_API_KEY" ]; then
+    log "Error: MORPH_API_KEY environment variable is not set"
+    exit 1
+fi
+
+log "Using API key from environment"
 
 # List all instances
 log "Listing all instances..."

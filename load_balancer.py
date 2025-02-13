@@ -69,7 +69,9 @@ class HashRequest(BaseModel):
 
 class WorkerManager:
     def __init__(self):
-        self.api_key = "morph_fdBw4OOQ9NwU6REhYRtmnv"
+        self.api_key = os.environ.get('MORPH_API_KEY')
+        if not self.api_key:
+            raise ValueError("MORPH_API_KEY environment variable must be set")
         self.api_base = "https://cloud.morph.so"
         self.workers: Dict[str, Dict] = {}
         self.request_counts: Dict[str, int] = {}

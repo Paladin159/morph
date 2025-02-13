@@ -7,7 +7,7 @@ User=root
 WorkingDirectory=/root/hashservice
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/root/hashservice
-Environment=MORPH_API_KEY=morph_fdBw4OOQ9NwU6REhYRtmnv
+EnvironmentFile=/root/hashservice/.env
 ExecStart=/usr/bin/python3 -m uvicorn worker:app --host 0.0.0.0 --port 5000
 Restart=always
 StandardOutput=journal
