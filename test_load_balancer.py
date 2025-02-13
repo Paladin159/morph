@@ -56,12 +56,21 @@ async def run_load_test():
     start_time = time.time()
     
     # Create a connection pool with a large number of connections
-    conn = aiohttp.TCPConnector(limit=0)
-    timeout = aiohttp.ClientTimeout(total=35)  # 35 seconds timeout (slightly more than server timeout)
+    conn = aiohttp.TCPConnector(limit=1000, force_close=False, enable_cleanup_closed=True)
+    timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)  # More forgiving timeouts
     
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-        tasks = [send_request(session, i) for i in range(TOTAL_REQUESTS)]
-        results = await asyncio.gather(*tasks)
+        # Send requests in smaller batches to avoid overwhelming the system
+        batch_size = 1000
+        results = []
+        
+        for i in range(0, TOTAL_REQUESTS, batch_size):
+            end = min(i + batch_size, TOTAL_REQUESTS)
+            batch = range(i, end)
+            batch_results = await asyncio.gather(*[send_request(session, j) for j in batch], return_exceptions=True)
+            results.extend(batch_results)
+            logger.info(f"Completed batch {i//batch_size + 1}/{(TOTAL_REQUESTS + batch_size - 1)//batch_size}")
+            await asyncio.sleep(1)  # Give the system a small breather between batches
     
     total_time = time.time() - start_time
     
