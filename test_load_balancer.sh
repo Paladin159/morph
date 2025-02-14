@@ -27,49 +27,26 @@ log "Starting load balancer instance from snapshot $LOAD_BALANCER_SNAPSHOT_ID...
 INSTANCE_ID=$(morphcloud instance start "$LOAD_BALANCER_SNAPSHOT_ID")
 log "Started load balancer instance: $INSTANCE_ID"
 
-# Wait for instance to be ready and get its URL
-MAX_ATTEMPTS=30
-ATTEMPT=1
-LOAD_BALANCER_URL=""
+# Export environment variables on the instance
+log "Setting environment variables..."
+morphcloud instance exec "$INSTANCE_ID" "sudo systemctl set-environment WORKER_SNAPSHOT_ID=$WORKER_SNAPSHOT_ID && sudo systemctl set-environment MORPH_API_KEY=$MORPH_API_KEY && sudo systemctl restart hash-balancer"
 
-while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    log "Checking instance status (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
-    
-    # Get instance info and extract URL
-    INSTANCE_INFO=$(morphcloud instance get "$INSTANCE_ID")
-    if echo "$INSTANCE_INFO" | grep -q "http://"; then
-        LOAD_BALANCER_URL=$(echo "$INSTANCE_INFO" | grep "http://" | grep ":8000" | awk '{print $2}')
-        if [ ! -z "$LOAD_BALANCER_URL" ]; then
-            # Check if service is responding
-            if curl -s -f "$LOAD_BALANCER_URL/health" > /dev/null; then
-                log "Load balancer is ready at $LOAD_BALANCER_URL"
-                break
-            fi
-        fi
-    fi
-    
-    if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-        log "Load balancer not ready yet, waiting..."
-        sleep 2
-    fi
-    ATTEMPT=$((ATTEMPT + 1))
-done
+# Get instance info and extract URL
+LOAD_BALANCER_URL=$(morphcloud instance expose-http "$INSTANCE_ID" web 8000)
+log "Load balancer URL: $LOAD_BALANCER_URL"
 
-if [ -z "$LOAD_BALANCER_URL" ]; then
-    log "Error: Failed to get load balancer URL"
-    morphcloud instance stop "$INSTANCE_ID"
-    exit 1
-fi
+sleep 2
 
 # Run load test
-TOTAL_REQUESTS=1000
-CONCURRENT_REQUESTS=50
+TOTAL_REQUESTS=16384
+CONCURRENT_REQUESTS=4000
 SUCCESSFUL=0
 FAILED=0
 
 log "Starting load test with $TOTAL_REQUESTS requests..."
 START_TIME=$(date +%s)
 
+# Send all requests as quickly as possible
 for ((i=0; i<TOTAL_REQUESTS; i+=$CONCURRENT_REQUESTS)); do
     BATCH_SIZE=$((TOTAL_REQUESTS - i))
     if [ $BATCH_SIZE -gt $CONCURRENT_REQUESTS ]; then
@@ -122,7 +99,19 @@ if [ $TOTAL_TIME -gt 0 ]; then
     log "Requests per second: $RPS"
 fi
 
-# Cleanup
+# Wait a bit to ensure all requests are processed
+log "Waiting for any remaining requests to complete..."
+sleep 5
+
+# Clean up workers
+log "Cleaning up worker instances..."
+WORKER_LIST=$(morphcloud instance list | grep "morphvm_" | awk '{print $1}')
+for worker_id in $WORKER_LIST; do
+    log "Stopping worker: $worker_id"
+    morphcloud instance stop "$worker_id"
+done
+
+# Clean up load balancer instance
 log "Cleaning up load balancer instance..."
 morphcloud instance stop "$INSTANCE_ID"
 log "Cleanup complete!" 

@@ -7,7 +7,6 @@ User=root
 WorkingDirectory=/root/hashservice
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/root/hashservice
-EnvironmentFile=/root/hashservice/.env
 ExecStart=/root/hashservice/venv/bin/uvicorn load_balancer:app --host 0.0.0.0 --port 8000 --log-level debug
 Restart=on-failure
 RestartSec=5

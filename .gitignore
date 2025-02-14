@@ -42,4 +42,6 @@ wheels/
 # Project specific
 API_call_format.txt
 Basic.py
-setup_worker.sh 
+setup_worker.sh
+hash-balancer-changed.service
+load_balancer_changed.py

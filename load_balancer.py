@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import aiohttp
@@ -13,6 +14,13 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("load_balancer")
 
+# Startup verification
+logger.info("Starting load balancer...")
+logger.info(f"Python executable: {sys.executable}")
+logger.info(f"Python version: {sys.version}")
+logger.info(f"WORKER_SNAPSHOT_ID: {os.environ.get('WORKER_SNAPSHOT_ID')}")
+logger.info(f"MORPH_API_KEY present: {'Yes' if os.environ.get('MORPH_API_KEY') else 'No'}")
+
 app = FastAPI()
 
 # Configuration
@@ -23,7 +31,9 @@ WORKER_PORT = 5000
 WORKER_IDLE_TIMEOUT = 30
 WORKER_SNAPSHOT_ID = os.environ.get('WORKER_SNAPSHOT_ID')
 if not WORKER_SNAPSHOT_ID:
+    logger.error("WORKER_SNAPSHOT_ID environment variable is not set!")
     raise ValueError("WORKER_SNAPSHOT_ID environment variable must be set")
+logger.info(f"Using worker snapshot ID: {WORKER_SNAPSHOT_ID}")
 
 # Global connection pool for worker requests
 aiohttp_session = None
@@ -55,7 +65,7 @@ async def shutdown_event():
                 try:
                     logger.info(f"Deleting worker instance {worker_id}")
                     response = requests.delete(
-                        f"{worker_manager.api_base}/api/instance/{worker_id}",
+                        f"{worker_manager.api_base}/instance/{worker_id}",
                         headers=worker_manager._headers()
                     )
                     if response.status_code not in (200, 204):
@@ -101,7 +111,7 @@ class WorkerManager:
         self.api_key = os.environ.get('MORPH_API_KEY')
         if not self.api_key:
             raise ValueError("MORPH_API_KEY environment variable must be set")
-        self.api_base = "https://cloud.morph.so"
+        self.api_base = "https://cloud.morph.so/api"
         self.workers: Dict[str, Dict] = {}
         self.request_counts: Dict[str, int] = {}
         self.last_request_time: Dict[str, float] = {}
@@ -159,7 +169,7 @@ class WorkerManager:
             logger.info(f"Starting new worker from snapshot {WORKER_SNAPSHOT_ID}")
             
             response = requests.post(
-                f"{self.api_base}/api/instance?snapshot_id={WORKER_SNAPSHOT_ID}",
+                f"{self.api_base}/instance?snapshot_id={WORKER_SNAPSHOT_ID}",
                 headers=self._headers()
             )
             data = response.json()
@@ -173,36 +183,45 @@ class WorkerManager:
             for attempt in range(max_attempts):
                 try:
                     response = requests.get(
-                        f"{self.api_base}/api/instance/{instance_id}",
+                        f"{self.api_base}/instance/{instance_id}",
                         headers=self._headers()
                     )
+                    logger.info(f"GET instance info response status: {response.status_code}")
+                    logger.info(f"GET instance info response body: {response.text}")
+                    
                     instance_info = response.json()
                     
                     # Get internal IP
                     internal_ip = instance_info.get('networking', {}).get('internal_ip')
                     if not internal_ip:
+                        logger.error(f"Worker internal IP not found. Instance info: {instance_info}")
                         raise Exception("Worker internal IP not found")
                     
                     logger.info(f"Worker {instance_id} assigned internal IP: {internal_ip}")
                     logger.info(f"Attempting to connect to worker at http://{internal_ip}:{WORKER_PORT}/health")
                     
                     async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            f"http://{internal_ip}:{WORKER_PORT}/health",
-                            timeout=aiohttp.ClientTimeout(total=5)
-                        ) as response:
-                            if response.status == 200:
-                                logger.info(f"Worker {instance_id} is ready and healthy at {internal_ip}:{WORKER_PORT}")
-                                async with self.lock:
-                                    self.workers[instance_id] = {
-                                        'id': instance_id,
-                                        'internal_ip': internal_ip,
-                                        'port': WORKER_PORT
-                                    }
-                                    self.request_counts[instance_id] = 0
-                                    self.last_request_time[instance_id] = time.time()
-                                    logger.info(f"Active workers: {', '.join(self.workers.keys())}")
-                                return
+                        try:
+                            async with session.get(
+                                f"http://{internal_ip}:{WORKER_PORT}/health",
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            ) as response:
+                                response_text = await response.text()
+                                logger.info(f"Health check response status: {response.status}, body: {response_text}")
+                                if response.status == 200:
+                                    logger.info(f"Worker {instance_id} is ready and healthy at {internal_ip}:{WORKER_PORT}")
+                                    async with self.lock:
+                                        self.workers[instance_id] = {
+                                            'id': instance_id,
+                                            'internal_ip': internal_ip,
+                                            'port': WORKER_PORT
+                                        }
+                                        self.request_counts[instance_id] = 0
+                                        self.last_request_time[instance_id] = time.time()
+                                        logger.info(f"Active workers: {', '.join(self.workers.keys())}")
+                                    return
+                        except Exception as e:
+                            logger.error(f"Error checking worker health: {str(e)}")
                 except Exception as e:
                     logger.debug(f"Worker {instance_id} not ready yet (attempt {attempt + 1}/{max_attempts}): {str(e)}")
                     await asyncio.sleep(2)
@@ -211,7 +230,7 @@ class WorkerManager:
             try:
                 logger.info(f"Cleaning up failed worker instance {instance_id}")
                 requests.delete(
-                    f"{self.api_base}/api/instance/{instance_id}",
+                    f"{self.api_base}/instance/{instance_id}",
                     headers=self._headers()
                 )
             except:
@@ -230,15 +249,12 @@ class WorkerManager:
     async def cleanup_workers(self):
         """Clean up all worker instances"""
         try:
+            # Wait a bit to ensure all requests are truly done
+            await asyncio.sleep(5)
+            
             print("\nAll requests processed!")
             print(f"Total workers created: {len(self.workers)}")
             print(f"Active workers: {', '.join(self.workers.keys())}")
-            
-            # Ask for cleanup confirmation
-            cleanup_input = input("\nWould you like to clean up? [Y/N]: ")
-            if cleanup_input.lower() != 'y':
-                print("Cleanup cancelled.")
-                return
             
             print("\nStarting cleanup process...")
             print("Cleaning up worker instances...")
@@ -247,7 +263,7 @@ class WorkerManager:
                     try:
                         print(f"Deleting worker instance {worker_id}")
                         response = requests.delete(
-                            f"{self.api_base}/api/instance/{worker_id}",
+                            f"{self.api_base}/instance/{worker_id}",
                             headers=self._headers()
                         )
                         if response.status_code not in (200, 204):
@@ -278,11 +294,6 @@ async def process_request_queue():
                 
         except Exception as e:
             logger.error(f"Error in queue processor: {str(e)}")
-            # Ensure cleanup runs even if there's an error
-            if request_tracker.processed == request_tracker.total:
-                print("\nAll requests processed (with errors), cleaning up workers...")
-                await worker_manager.cleanup_workers()
-                print("\nCleanup complete!")
 
 async def process_single_request(request_data):
     """Process a single request from the queue"""
@@ -340,11 +351,6 @@ async def process_single_request(request_data):
         future.set_exception(HTTPException(status_code=500, detail=str(e)))
 
     request_queue.task_done()
-    
-    # If this was the last request, run cleanup
-    if request_tracker.processed == request_tracker.total:
-        print("\nAll requests processed!")
-        await worker_manager.cleanup_workers()
 
 @app.post("/hash")
 async def hash_string(request: HashRequest, background_tasks: BackgroundTasks):
