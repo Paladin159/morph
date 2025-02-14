@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import aiohttp
 from typing import List, Dict, Optional
@@ -18,18 +18,25 @@ app = FastAPI()
 # Configuration
 MAX_WORKERS = 12
 REQUESTS_PER_WORKER = 16
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 60
 WORKER_PORT = 5000
 WORKER_IDLE_TIMEOUT = 30
+WORKER_SNAPSHOT_ID = os.environ.get('WORKER_SNAPSHOT_ID')
+if not WORKER_SNAPSHOT_ID:
+    raise ValueError("WORKER_SNAPSHOT_ID environment variable must be set")
 
 # Global connection pool for worker requests
 aiohttp_session = None
 
+# Request queue
+request_queue = asyncio.Queue()
+processing_task = None
+
 async def get_aiohttp_session():
     global aiohttp_session
     if aiohttp_session is None:
-        conn = aiohttp.TCPConnector(limit=1000, force_close=False, enable_cleanup_closed=True)
-        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+        conn = aiohttp.TCPConnector(limit=None, force_close=False, enable_cleanup_closed=True)
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)
         aiohttp_session = aiohttp.ClientSession(connector=conn, timeout=timeout)
     return aiohttp_session
 
@@ -39,6 +46,28 @@ async def shutdown_event():
     if aiohttp_session:
         await aiohttp_session.close()
         aiohttp_session = None
+    
+    # Clean up all worker instances on shutdown
+    logger.info("Cleaning up worker instances on shutdown")
+    try:
+        async with worker_manager.lock:
+            for worker_id in list(worker_manager.workers.keys()):
+                try:
+                    logger.info(f"Deleting worker instance {worker_id}")
+                    response = requests.delete(
+                        f"{worker_manager.api_base}/api/instance/{worker_id}",
+                        headers=worker_manager._headers()
+                    )
+                    if response.status_code not in (200, 204):
+                        logger.warning(f"Unexpected status code when deleting worker: {response.status_code}")
+                    del worker_manager.workers[worker_id]
+                    del worker_manager.request_counts[worker_id]
+                    del worker_manager.last_request_time[worker_id]
+                    logger.info(f"Successfully deleted worker {worker_id}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up worker {worker_id}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error during shutdown cleanup: {str(e)}")
 
 # Request tracking
 class RequestTracker:
@@ -77,27 +106,7 @@ class WorkerManager:
         self.request_counts: Dict[str, int] = {}
         self.last_request_time: Dict[str, float] = {}
         self.lock = asyncio.Lock()
-        self.worker_creation_lock = asyncio.Lock()  # Separate lock for worker creation
-        
-        # Load permanent worker info
-        try:
-            with open('/root/hashservice/worker_config.json', 'r') as f:
-                config = json.load(f)
-                self.permanent_worker_id = config['template_worker_id']
-                self.permanent_worker_url = config['template_worker_url']
-                logger.info(f"Loaded permanent worker config: ID={self.permanent_worker_id}, URL={self.permanent_worker_url}")
-                
-                # Add permanent worker to our tracking
-                self.workers[self.permanent_worker_id] = {
-                    'id': self.permanent_worker_id,
-                    'url': self.permanent_worker_url,
-                    'port': WORKER_PORT
-                }
-                self.request_counts[self.permanent_worker_id] = 0
-                self.last_request_time[self.permanent_worker_id] = time.time()  # For future cleanup
-        except Exception as e:
-            logger.error(f"Failed to load worker config: {str(e)}")
-            raise
+        self.worker_creation_lock = asyncio.Lock()
 
     def _headers(self):
         return {
@@ -143,79 +152,64 @@ class WorkerManager:
                     self.request_counts[best_worker['id']] += 1
                     self.last_request_time[best_worker['id']] = time.time()
                     return best_worker
-
-                # If all else fails, use permanent worker
-                self.request_counts[self.permanent_worker_id] += 1
-                self.last_request_time[self.permanent_worker_id] = time.time()
-                return self.workers[self.permanent_worker_id]
+                return None
 
     async def create_worker(self):
         try:
-            logger.info("Branching new worker instance...")
-            # Branch from permanent worker
+            logger.info(f"Starting new worker from snapshot {WORKER_SNAPSHOT_ID}")
+            
             response = requests.post(
-                f"{self.api_base}/api/instance/{self.permanent_worker_id}/branch",
-                headers=self._headers(),
-                json={"metadata": {"type": "worker"}}
+                f"{self.api_base}/api/instance?snapshot_id={WORKER_SNAPSHOT_ID}",
+                headers=self._headers()
             )
             data = response.json()
-            instances = data.get('instances', [])
-            if not instances:
-                raise Exception("No instances in branch response")
-            instance = instances[0]
-            instance_id = instance.get('id')
+            instance_id = data.get('id')
             if not instance_id:
-                raise Exception("Failed to get branched instance ID from response")
+                raise Exception("Failed to get instance ID from start response")
             
-            logger.info(f"Created worker instance {instance_id}, waiting for readiness...")
+            logger.info(f"Started worker instance {instance_id}")
             
-            # Wait for instance and service to be ready
             max_attempts = 30
             for attempt in range(max_attempts):
                 try:
-                    # Get instance details
                     response = requests.get(
                         f"{self.api_base}/api/instance/{instance_id}",
                         headers=self._headers()
                     )
                     instance_info = response.json()
                     
-                    # Get HTTP service URL
-                    http_services = instance_info.get('networking', {}).get('http_services', [])
-                    worker_url = None
-                    for service in http_services:
-                        if service.get('name') == 'worker' and service.get('port') == WORKER_PORT:
-                            worker_url = service.get('url')
-                            break
+                    # Get internal IP
+                    internal_ip = instance_info.get('networking', {}).get('internal_ip')
+                    if not internal_ip:
+                        raise Exception("Worker internal IP not found")
                     
-                    if not worker_url:
-                        raise Exception("Worker HTTP service not found in instance info")
+                    logger.info(f"Worker {instance_id} assigned internal IP: {internal_ip}")
+                    logger.info(f"Attempting to connect to worker at http://{internal_ip}:{WORKER_PORT}/health")
                     
-                    logger.info(f"Attempting to connect to worker at {worker_url}/health")
-                    # Try to connect to the worker's health endpoint
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
-                            f"{worker_url}/health",
+                            f"http://{internal_ip}:{WORKER_PORT}/health",
                             timeout=aiohttp.ClientTimeout(total=5)
                         ) as response:
                             if response.status == 200:
-                                logger.info(f"Worker {instance_id} is ready")
+                                logger.info(f"Worker {instance_id} is ready and healthy at {internal_ip}:{WORKER_PORT}")
                                 async with self.lock:
                                     self.workers[instance_id] = {
                                         'id': instance_id,
-                                        'url': worker_url,
+                                        'internal_ip': internal_ip,
                                         'port': WORKER_PORT
                                     }
                                     self.request_counts[instance_id] = 0
                                     self.last_request_time[instance_id] = time.time()
+                                    logger.info(f"Active workers: {', '.join(self.workers.keys())}")
                                 return
                 except Exception as e:
-                    logger.debug(f"Worker not ready yet (attempt {attempt + 1}/{max_attempts}): {str(e)}")
+                    logger.debug(f"Worker {instance_id} not ready yet (attempt {attempt + 1}/{max_attempts}): {str(e)}")
                     await asyncio.sleep(2)
             
-            # If we get here, worker failed to become ready
             logger.error(f"Worker {instance_id} failed to become ready after {max_attempts} attempts")
             try:
+                logger.info(f"Cleaning up failed worker instance {instance_id}")
                 requests.delete(
                     f"{self.api_base}/api/instance/{instance_id}",
                     headers=self._headers()
@@ -225,65 +219,45 @@ class WorkerManager:
             
         except Exception as e:
             logger.error(f"Failed to create worker: {str(e)}")
-            # No need to re-raise since this is running in background
 
     async def release_worker(self, worker_id: str):
         async with self.lock:
             if worker_id in self.request_counts:
                 self.request_counts[worker_id] -= 1
-                self.last_request_time[worker_id] = time.time()  # For future cleanup
+                self.last_request_time[worker_id] = time.time()
                 logger.debug(f"Released worker {worker_id}, load: {self.request_counts[worker_id]}")
 
     async def cleanup_workers(self):
-        """Clean up all worker instances except the permanent worker and delete snapshots"""
+        """Clean up all worker instances"""
         try:
-            print("\nAll requests processed, cleaning up...")
+            print("\nAll requests processed!")
+            print(f"Total workers created: {len(self.workers)}")
+            print(f"Active workers: {', '.join(self.workers.keys())}")
             
-            # First clean up worker instances
+            # Ask for cleanup confirmation
+            cleanup_input = input("\nWould you like to clean up? [Y/N]: ")
+            if cleanup_input.lower() != 'y':
+                print("Cleanup cancelled.")
+                return
+            
+            print("\nStarting cleanup process...")
             print("Cleaning up worker instances...")
             async with self.lock:
                 for worker_id in list(self.workers.keys()):
-                    if worker_id != self.permanent_worker_id:
-                        try:
-                            print(f"Deleting worker instance {worker_id}")
-                            response = requests.delete(
-                                f"{self.api_base}/api/instance/{worker_id}",
-                                headers=self._headers()
-                            )
-                            if response.status_code not in (200, 204):
-                                logger.warning(f"Unexpected status code when deleting worker: {response.status_code}")
-                            del self.workers[worker_id]
-                            del self.request_counts[worker_id]
-                            del self.last_request_time[worker_id]
-                        except Exception as e:
-                            logger.error(f"Error cleaning up worker {worker_id}: {str(e)}")
-            
-            # Then clean up snapshots
-            print("Cleaning up snapshots...")
-            try:
-                # Get snapshot IDs to preserve from config
-                with open('/root/hashservice/worker_config.json', 'r') as f:
-                    config = json.load(f)
-                    worker_snapshot = config.get('worker_snapshot_id')
-                    lb_snapshot = config.get('load_balancer_snapshot_id')
-                    preserved_snapshots = {worker_snapshot, lb_snapshot}
-
-                # Get all snapshots
-                response = requests.get(
-                    f"{self.api_base}/api/snapshots",
-                    headers=self._headers()
-                )
-                snapshots = response.json().get('snapshots', [])
-                for snapshot in snapshots:
-                    snapshot_id = snapshot.get('id')
-                    if snapshot_id and snapshot_id not in preserved_snapshots:
-                        print(f"Deleting snapshot {snapshot_id}")
-                        requests.delete(
-                            f"{self.api_base}/api/snapshot/{snapshot_id}",
+                    try:
+                        print(f"Deleting worker instance {worker_id}")
+                        response = requests.delete(
+                            f"{self.api_base}/api/instance/{worker_id}",
                             headers=self._headers()
                         )
-            except Exception as e:
-                logger.error(f"Error cleaning up snapshots: {str(e)}")
+                        if response.status_code not in (200, 204):
+                            logger.warning(f"Unexpected status code when deleting worker: {response.status_code}")
+                        del self.workers[worker_id]
+                        del self.request_counts[worker_id]
+                        del self.last_request_time[worker_id]
+                        print(f"Successfully deleted worker {worker_id}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning up worker {worker_id}: {str(e)}")
             
             print("Cleanup complete!")
             
@@ -292,81 +266,112 @@ class WorkerManager:
 
 worker_manager = WorkerManager()
 
-@app.post("/hash")
-async def hash_string(request: HashRequest):
-    start_time = time.time()
-    await request_tracker.add_to_total()
+async def process_request_queue():
+    """Background task to process queued requests"""
+    while True:
+        try:
+            # Process requests as they come
+            request_data = await request_queue.get()
+            
+            # Create task for the request
+            asyncio.create_task(process_single_request(request_data))
+                
+        except Exception as e:
+            logger.error(f"Error in queue processor: {str(e)}")
+            # Ensure cleanup runs even if there's an error
+            if request_tracker.processed == request_tracker.total:
+                print("\nAll requests processed (with errors), cleaning up workers...")
+                await worker_manager.cleanup_workers()
+                print("\nCleanup complete!")
+
+async def process_single_request(request_data):
+    """Process a single request from the queue"""
+    input_string = request_data["input_string"]
+    future = request_data["future"]
+    worker = None
     
     try:
-        worker = None
         session = await get_aiohttp_session()
+        retry_count = 0
+        max_retries = 3
         
-        while True:
-            if time.time() - start_time > DEFAULT_TIMEOUT:
-                logger.error("Request timed out waiting for worker")
-                # Run cleanup if this was the last request
-                if request_tracker.processed == request_tracker.total:
-                    print("\nAll requests processed, cleaning up workers...")
-                    await worker_manager.cleanup_workers()
-                    print("\nCleanup complete!")
-                raise HTTPException(status_code=503, detail="Service unavailable - timeout waiting for worker")
-
+        while retry_count < max_retries:
             try:
                 worker = await worker_manager.get_or_create_worker()
                 if not worker:
+                    retry_count += 1
                     continue
 
-                worker_url = f"{worker['url']}/hash"
+                # Use internal IP for worker communication
+                worker_url = f"http://{worker['internal_ip']}:{worker['port']}/hash"
                 async with session.post(
                     worker_url,
-                    json={"input_string": request.input_string},
+                    json={"input_string": input_string},
                     timeout=aiohttp.ClientTimeout(total=20)
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f"Worker returned error {response.status}: {error_text}")
-                        await worker_manager.release_worker(worker['id'])
-                        # Run cleanup if this was the last request
-                        if request_tracker.processed == request_tracker.total:
-                            print("\nAll requests processed, cleaning up workers...")
-                            await worker_manager.cleanup_workers()
-                            print("\nCleanup complete!")
-                        raise HTTPException(status_code=response.status, detail=error_text)
+                        if worker:
+                            await worker_manager.release_worker(worker['id'])
+                        retry_count += 1
+                        continue
                     
                     result = await response.json()
                     await worker_manager.release_worker(worker['id'])
                     await request_tracker.increment_processed()
-                    
-                    # Run cleanup if this was the last request
-                    if request_tracker.processed == request_tracker.total:
-                        print("\nAll requests processed, cleaning up workers...")
-                        await worker_manager.cleanup_workers()
-                        print("\nCleanup complete!")
-                    
-                    return result
+                    future.set_result(result)
+                    break
 
             except aiohttp.ClientError as e:
                 logger.error(f"Network error with worker {worker['id'] if worker else 'unknown'}: {str(e)}")
                 if worker:
                     await worker_manager.release_worker(worker['id'])
-                # Run cleanup if this was the last request
-                if request_tracker.processed == request_tracker.total:
-                    print("\nAll requests processed, cleaning up workers...")
-                    await worker_manager.cleanup_workers()
-                    print("\nCleanup complete!")
-                # Don't raise here, let it retry with a different worker
-                await asyncio.sleep(0.1)  # Small delay before retry
+                retry_count += 1
                 continue
 
+        if retry_count >= max_retries:
+            future.set_exception(HTTPException(status_code=503, detail="Service unavailable after retries"))
+
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error processing request: {str(e)}")
         if worker:
             await worker_manager.release_worker(worker['id'])
-        # Run cleanup if this was the last request
-        if request_tracker.processed == request_tracker.total:
-            print("\nAll requests processed, cleaning up workers...")
-            await worker_manager.cleanup_workers()
-            print("\nCleanup complete!")
+        future.set_exception(HTTPException(status_code=500, detail=str(e)))
+
+    request_queue.task_done()
+    
+    # If this was the last request, run cleanup
+    if request_tracker.processed == request_tracker.total:
+        print("\nAll requests processed!")
+        await worker_manager.cleanup_workers()
+
+@app.post("/hash")
+async def hash_string(request: HashRequest, background_tasks: BackgroundTasks):
+    await request_tracker.add_to_total()
+    
+    # Start the queue processor if it's not running
+    global processing_task
+    if processing_task is None or processing_task.done():
+        processing_task = asyncio.create_task(process_request_queue())
+    
+    # Create a future to get the result
+    future = asyncio.Future()
+    
+    # Queue the request
+    await request_queue.put({
+        "input_string": request.input_string,
+        "future": future
+    })
+    
+    try:
+        # Wait for the result with timeout
+        return await asyncio.wait_for(future, timeout=DEFAULT_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Request timed out")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")

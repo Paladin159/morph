@@ -40,5 +40,6 @@ wheels/
 .env.local
 
 # Project specific
+API_call_format.txt
 Basic.py
 setup_worker.sh 
