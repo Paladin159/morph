@@ -4,13 +4,11 @@ import sys
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import aiohttp
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 import time
 import requests
 import json
 import os
-from dataclasses import dataclass
-from enum import Enum
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,14 +25,10 @@ app = FastAPI()
 
 # Configuration
 MAX_WORKERS = 12
-MIN_WORKERS = 2  # Minimum number of workers to maintain
 REQUESTS_PER_WORKER = 16
-TARGET_RPS_PER_WORKER = 200
-QUEUE_LENGTH_SCALE_THRESHOLD = 32  # Scale out if queue length exceeds this
-CPU_SCALE_OUT_THRESHOLD = 70.0  # Scale out if CPU > 70%
-CPU_SCALE_IN_THRESHOLD = 50.0   # Scale in if CPU < 50%
 DEFAULT_TIMEOUT = 60
 WORKER_PORT = 5000
+WORKER_IDLE_TIMEOUT = 30
 WORKER_SNAPSHOT_ID = os.environ.get('WORKER_SNAPSHOT_ID')
 if not WORKER_SNAPSHOT_ID:
     logger.error("WORKER_SNAPSHOT_ID environment variable is not set!")
@@ -47,9 +41,6 @@ aiohttp_session = None
 # Request queue
 request_queue = asyncio.Queue()
 processing_task = None
-
-# System state
-system_state = SystemState()
 
 async def get_aiohttp_session():
     global aiohttp_session
@@ -115,92 +106,6 @@ request_tracker = RequestTracker()
 class HashRequest(BaseModel):
     input_string: str
 
-class RequestStatus(Enum):
-    QUEUED = "queued"
-    IN_FLIGHT = "in_flight"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-@dataclass
-class RequestState:
-    id: str
-    input_string: str
-    status: RequestStatus
-    worker_id: Optional[str]
-    start_time: float
-    completion_time: Optional[float] = None
-    error: Optional[str] = None
-
-class SystemState:
-    def __init__(self):
-        self.requests: Dict[str, RequestState] = {}
-        self.worker_requests: Dict[str, Set[str]] = {}  # worker_id -> set of request_ids
-        self.worker_cpu_usage: Dict[str, float] = {}
-        self.lock = asyncio.Lock()
-        self.request_counter = 0
-
-    async def add_request(self, input_string: str) -> str:
-        async with self.lock:
-            self.request_counter += 1
-            request_id = f"req_{self.request_counter}"
-            self.requests[request_id] = RequestState(
-                id=request_id,
-                input_string=input_string,
-                status=RequestStatus.QUEUED,
-                worker_id=None,
-                start_time=time.time()
-            )
-            return request_id
-
-    async def assign_request_to_worker(self, request_id: str, worker_id: str):
-        async with self.lock:
-            if request_id in self.requests:
-                self.requests[request_id].status = RequestStatus.IN_FLIGHT
-                self.requests[request_id].worker_id = worker_id
-                if worker_id not in self.worker_requests:
-                    self.worker_requests[worker_id] = set()
-                self.worker_requests[worker_id].add(request_id)
-
-    async def complete_request(self, request_id: str, success: bool, error: Optional[str] = None):
-        async with self.lock:
-            if request_id in self.requests:
-                request = self.requests[request_id]
-                request.status = RequestStatus.COMPLETED if success else RequestStatus.FAILED
-                request.completion_time = time.time()
-                request.error = error
-                if request.worker_id and request.worker_id in self.worker_requests:
-                    self.worker_requests[request.worker_id].remove(request_id)
-
-    async def update_worker_cpu(self, worker_id: str, cpu_usage: float):
-        async with self.lock:
-            self.worker_cpu_usage[worker_id] = cpu_usage
-
-    def get_metrics(self) -> dict:
-        total_requests = len(self.requests)
-        queued = sum(1 for r in self.requests.values() if r.status == RequestStatus.QUEUED)
-        in_flight = sum(1 for r in self.requests.values() if r.status == RequestStatus.IN_FLIGHT)
-        completed = sum(1 for r in self.requests.values() if r.status == RequestStatus.COMPLETED)
-        failed = sum(1 for r in self.requests.values() if r.status == RequestStatus.FAILED)
-        
-        avg_cpu = sum(self.worker_cpu_usage.values()) / len(self.worker_cpu_usage) if self.worker_cpu_usage else 0
-        
-        return {
-            "total_requests": total_requests,
-            "queued_requests": queued,
-            "in_flight_requests": in_flight,
-            "completed_requests": completed,
-            "failed_requests": failed,
-            "workers": len(self.worker_requests),
-            "average_cpu_usage": avg_cpu,
-            "worker_loads": {
-                worker_id: {
-                    "active_requests": len(requests),
-                    "cpu_usage": self.worker_cpu_usage.get(worker_id, 0)
-                }
-                for worker_id, requests in self.worker_requests.items()
-            }
-        }
-
 class WorkerManager:
     def __init__(self):
         self.api_key = os.environ.get('MORPH_API_KEY')
@@ -210,12 +115,8 @@ class WorkerManager:
         self.workers: Dict[str, Dict] = {}
         self.request_counts: Dict[str, int] = {}
         self.last_request_time: Dict[str, float] = {}
-        self.worker_rps: Dict[str, float] = {}  # Track RPS per worker
         self.lock = asyncio.Lock()
         self.worker_creation_lock = asyncio.Lock()
-        self.last_scale_check = time.time()
-        self.scale_check_interval = 1.0  # Check scaling every second
-        self.target_workers = MIN_WORKERS  # Track desired number of workers
 
     def _headers(self):
         return {
@@ -224,99 +125,44 @@ class WorkerManager:
             'Authorization': f'Bearer {self.api_key}'
         }
 
-    async def check_scaling_needs(self):
-        """Check if we need to scale based on CPU usage and queue length"""
-        current_time = time.time()
-        if current_time - self.last_scale_check < self.scale_check_interval:
-            return
-
-        self.last_scale_check = current_time
-        
-        async with self.lock:
-            metrics = system_state.get_metrics()
-            avg_cpu = metrics["average_cpu_usage"]
-            queue_length = metrics["queued_requests"]
-            current_workers = len(self.workers)
-
-            # Scale out conditions
-            if (avg_cpu > CPU_SCALE_OUT_THRESHOLD or queue_length > QUEUE_LENGTH_SCALE_THRESHOLD) and current_workers < MAX_WORKERS:
-                self.target_workers = min(current_workers + 1, MAX_WORKERS)
-                logger.info(f"Scaling out to {self.target_workers} workers (CPU: {avg_cpu:.1f}%, Queue: {queue_length})")
-                asyncio.create_task(self.create_worker())
-
-            # Scale in conditions
-            elif avg_cpu < CPU_SCALE_IN_THRESHOLD and current_workers > MIN_WORKERS and queue_length == 0:
-                self.target_workers = max(current_workers - 1, MIN_WORKERS)
-                logger.info(f"Scaling in to {self.target_workers} workers (CPU: {avg_cpu:.1f}%)")
-                # Find least loaded worker to remove
-                min_load_worker = min(self.workers.keys(), key=lambda w: len(system_state.worker_requests.get(w, set())))
-                asyncio.create_task(self.remove_worker(min_load_worker))
-
-    async def remove_worker(self, worker_id: str):
-        """Gracefully remove a worker"""
-        try:
-            # Wait for worker to finish current requests
-            while system_state.worker_requests.get(worker_id, set()):
-                await asyncio.sleep(1)
-            
-            # Remove worker
-            logger.info(f"Removing worker {worker_id}")
-            response = requests.delete(
-                f"{self.api_base}/instance/{worker_id}",
-                headers=self._headers()
-            )
-            if response.status_code in (200, 204):
-                async with self.lock:
-                    del self.workers[worker_id]
-                    del self.request_counts[worker_id]
-                    del self.last_request_time[worker_id]
-        except Exception as e:
-            logger.error(f"Error removing worker {worker_id}: {str(e)}")
-
     async def get_or_create_worker(self):
-        await self.check_scaling_needs()
-        
         async with self.lock:
             # First try to find an available worker
-            min_load = float('inf')
-            best_worker = None
-            
-            for worker_id, worker in self.workers.items():
-                current_load = self.request_counts[worker_id]
-                if current_load < min_load:
-                    min_load = current_load
-                    best_worker = worker
+            for worker_id, count in self.request_counts.items():
+                if count < REQUESTS_PER_WORKER:
+                    self.request_counts[worker_id] += 1
+                    self.last_request_time[worker_id] = time.time()
+                    return self.workers[worker_id]
 
-            if best_worker and min_load < REQUESTS_PER_WORKER:
-                self.request_counts[best_worker['id']] += 1
-                self.last_request_time[best_worker['id']] = time.time()
-                return best_worker
+        # If no worker is available, try to create one (with separate lock)
+        async with self.worker_creation_lock:
+            # Check again in case another task created a worker
+            async with self.lock:
+                for worker_id, count in self.request_counts.items():
+                    if count < REQUESTS_PER_WORKER:
+                        self.request_counts[worker_id] += 1
+                        self.last_request_time[worker_id] = time.time()
+                        return self.workers[worker_id]
 
-        # If no suitable worker found or load is high, try to create a new one
-        if len(self.workers) < MAX_WORKERS:
-            try:
-                await self.create_worker()
-            except Exception as e:
-                logger.error(f"Failed to create worker: {str(e)}")
+            if len(self.workers) < MAX_WORKERS:
+                try:
+                    await self.create_worker()
+                except Exception as e:
+                    logger.error(f"Failed to create worker: {str(e)}")
 
-        # Use least loaded worker
-        async with self.lock:
-            if not self.workers:
+            # Use the least loaded worker
+            async with self.lock:
+                min_count = float('inf')
+                best_worker = None
+                for worker_id, count in self.request_counts.items():
+                    if count < min_count:
+                        min_count = count
+                        best_worker = self.workers[worker_id]
+                if best_worker:
+                    self.request_counts[best_worker['id']] += 1
+                    self.last_request_time[best_worker['id']] = time.time()
+                    return best_worker
                 return None
-                
-            min_load = float('inf')
-            best_worker = None
-            for worker_id, worker in self.workers.items():
-                current_load = self.request_counts[worker_id]
-                if current_load < min_load:
-                    min_load = current_load
-                    best_worker = worker
-            
-            if best_worker:
-                self.request_counts[best_worker['id']] += 1
-                self.last_request_time[best_worker['id']] = time.time()
-                return best_worker
-            return None
 
     async def create_worker(self):
         try:
@@ -537,8 +383,3 @@ async def hash_string(request: HashRequest, background_tasks: BackgroundTasks):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
-
-@app.get("/metrics")
-async def get_metrics():
-    """Expose system metrics and state"""
-    return system_state.get_metrics()
